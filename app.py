@@ -7,6 +7,63 @@ import os
 
 app = Flask(__name__)
 
+import re
+
+BANK_PATTERNS = {
+    "HDFC Bank": ["hdfc", "hdfcbank", "hdfc bank"],
+    "SBI": ["sbi", "sbin", "state bank of india", "statebank"],
+    "ICICI Bank": ["icici", "icici bank"],
+    "Axis Bank": ["axis", "axis bank"],
+    "IndusInd Bank": ["indusind", "indusind bank"],
+}
+
+def detect_bank_from_filename(filename):
+    if not filename:
+        return "Unknown Bank"
+    lower = filename.lower()
+    for bank, keys in BANK_PATTERNS.items():
+        for key in keys:
+            pattern = rf"(?:^|\W){re.escape(key)}(?:$|\W|[0-9])"
+            if re.search(pattern, lower) or key in lower:
+                return bank
+    return "Unknown Bank"
+
+def detect_bank_from_text(text):
+    if not text:
+        return None
+    lower = text.lower()
+    for bank, keys in BANK_PATTERNS.items():
+        for key in keys:
+            pattern = rf"(?:^|\W){re.escape(key)}(?:$|\W|[0-9])"
+            if re.search(pattern, lower) or key in lower:
+                return bank
+    return None
+
+def detect_bank_from_bytes(file_bytes):
+    if not file_bytes:
+        return None
+    try:
+        text = file_bytes.decode("utf-8", errors="ignore").lower()
+    except Exception:
+        return None
+    for bank, keys in BANK_PATTERNS.items():
+        for key in keys:
+            if key in text:
+                return bank
+    return None
+
+
+def infer_bank_from_df(df):
+    if df is None or df.empty:
+        return None
+    for col in ["Narration", "Narration(Short)", "Chq./Ref.No.", "Category"]:
+        if col in df.columns:
+            for v in df[col].astype(str).head(40):
+                found = detect_bank_from_text(v)
+                if found:
+                    return found
+    return None
+
 # ── Excel styling ─────────────────────────────────────────────
 
 def style_sheet(workbook, sheet_name, headers, rows):
@@ -112,8 +169,25 @@ def extract_multi():
         df, error  = extract_transactions(file_bytes, password)
         if error:
             return jsonify({"error": f"{file.filename}: {error}"}), 400
+
+        bank = detect_bank_from_filename(file.filename)
+        if bank == "Unknown Bank":
+            inferred = infer_bank_from_df(df)
+            if inferred:
+                bank = inferred
+        if bank == "Unknown Bank":
+            fallback = detect_bank_from_bytes(file_bytes)
+            if fallback:
+                bank = fallback
+
+        if "Bank" not in df.columns:
+            df.insert(0, "Bank", bank)
+        else:
+            df["Bank"] = bank
+
         results.append({
             "filename": file.filename,
+            "bank": bank,
             "columns":  df.columns.tolist(),
             "rows":     df.to_dict(orient="records")
         })
