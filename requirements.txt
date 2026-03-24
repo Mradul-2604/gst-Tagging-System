@@ -6,3 +6,4 @@ openpyxl
 xlsxwriter
 groq
 python-dotenv
+gunicorn
