@@ -1,13 +1,12 @@
 from flask import Flask, request, send_file, render_template, jsonify
 import xlsxwriter
-from extractor import extract_transactions
+from extractor import extract_transactions, extract_transactions_with_memory
 import pandas as pd
 import io
 import os
+import re
 
 app = Flask(__name__)
-
-import re
 
 BANK_PATTERNS = {
     "HDFC Bank": ["hdfc", "hdfcbank", "hdfc bank"],
@@ -23,8 +22,7 @@ def detect_bank_from_filename(filename):
     lower = filename.lower()
     for bank, keys in BANK_PATTERNS.items():
         for key in keys:
-            pattern = rf"(?:^|\W){re.escape(key)}(?:$|\W|[0-9])"
-            if re.search(pattern, lower) or key in lower:
+            if key in lower:
                 return bank
     return "Unknown Bank"
 
@@ -34,8 +32,7 @@ def detect_bank_from_text(text):
     lower = text.lower()
     for bank, keys in BANK_PATTERNS.items():
         for key in keys:
-            pattern = rf"(?:^|\W){re.escape(key)}(?:$|\W|[0-9])"
-            if re.search(pattern, lower) or key in lower:
+            if key in lower:
                 return bank
     return None
 
@@ -43,7 +40,7 @@ def detect_bank_from_bytes(file_bytes):
     if not file_bytes:
         return None
     try:
-        text = file_bytes.decode("utf-8", errors="ignore").lower()
+        text = file_bytes[:5000].decode("utf-8", errors="ignore").lower()
     except Exception:
         return None
     for bank, keys in BANK_PATTERNS.items():
@@ -52,11 +49,10 @@ def detect_bank_from_bytes(file_bytes):
                 return bank
     return None
 
-
 def infer_bank_from_df(df):
     if df is None or df.empty:
         return None
-    for col in ["Narration", "Narration(Short)", "Chq./Ref.No.", "Category"]:
+    for col in ["Narration", "Narration(Short)", "Chq./Ref.No."]:
         if col in df.columns:
             for v in df[col].astype(str).head(40):
                 found = detect_bank_from_text(v)
@@ -67,7 +63,6 @@ def infer_bank_from_df(df):
 # ── Excel styling ─────────────────────────────────────────────
 
 def style_sheet(workbook, sheet_name, headers, rows):
-    # All columns narrow + wrap_text on everything — matches the reference format
     col_widths = {
         "Date": 12, "Narration": 52, "Narration(Short)": 26,
         "Chq./Ref.No.": 24, "Dr/Cr": 8, "Amount(₹)": 15,
@@ -99,16 +94,13 @@ def style_sheet(workbook, sheet_name, headers, rows):
 
     ws = workbook.add_worksheet(sheet_name)
 
-    # Set all column widths first
     for ci, h in enumerate(headers):
         ws.set_column(ci, ci, col_widths.get(h, 15))
 
-    # Header row
     ws.set_row(0, 30)
     for ci, h in enumerate(headers):
         ws.write(0, ci, h, hdr)
 
-    # Data rows — height based on longest cell content in that row
     narr_w  = col_widths.get("Narration", 30)
     short_w = col_widths.get("Narration(Short)", 18)
     cat_w   = col_widths.get("Category", 22)
@@ -119,7 +111,6 @@ def style_sheet(workbook, sheet_name, headers, rows):
     for ri, row in enumerate(rows):
         k = "e" if (ri + 2) % 2 == 0 else "o"
 
-        # Calculate row height from wrapping columns
         def lines(val, w): return max(1, -(-len(str(val)) // w))
         max_lines = 1
         for col_key, w in [("Narration", narr_w), ("Narration(Short)", short_w),
@@ -163,10 +154,19 @@ def extract_multi():
     results = []
     all_dfs = []
 
+    # Optional previous Excel for smart memory
+    prev_excel = request.files.get("prev_excel")
+    excel_bytes = prev_excel.read() if prev_excel and prev_excel.filename else None
+    if excel_bytes:
+        print(f"Previous Excel uploaded: {prev_excel.filename} ({len(excel_bytes)} bytes)")
+
     for i, file in enumerate(files):
         password   = passwords[i] if i < len(passwords) else ""
         file_bytes = file.read()
-        df, error  = extract_transactions(file_bytes, password)
+        if excel_bytes:
+            df, error = extract_transactions_with_memory(file_bytes, password, excel_bytes)
+        else:
+            df, error = extract_transactions(file_bytes, password)
         if error:
             return jsonify({"error": f"{file.filename}: {error}"}), 400
 
@@ -187,7 +187,7 @@ def extract_multi():
 
         results.append({
             "filename": file.filename,
-            "bank": bank,
+            "bank":     bank,
             "columns":  df.columns.tolist(),
             "rows":     df.to_dict(orient="records")
         })
@@ -263,4 +263,4 @@ def download_excel():
     )
 
 if __name__ == "__main__":
-    app.run()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)

@@ -905,11 +905,23 @@
     <div class="card">
       <div class="card-header">
         <span class="card-title">Statements</span>
-        <button class="btn-primary" style="height:32px;font-size:12px;padding:0 14px;"
-          onclick="document.getElementById('hiddenFileInput').click()">
-          + Add PDF files
-        </button>
-        <input type="file" id="hiddenFileInput" accept=".pdf" multiple onchange="onFilesAdded(this)" />
+        <div style="display:flex; align-items:center; gap:8px;">
+          <input type="file" id="hiddenFileInput" accept=".pdf" multiple onchange="onFilesAdded(this)"
+            style="display:none;" />
+          <button class="btn-primary" style="height:32px;font-size:12px;padding:0 14px;"
+            onclick="document.getElementById('hiddenFileInput').click()">
+            + Add PDF files
+          </button>
+          <label
+            style="height:32px; padding:0 14px; background:var(--ink); color:#fff; border-radius:7px; font-size:12px; font-weight:600; cursor:pointer; display:flex; align-items:center; gap:5px; white-space:nowrap;">
+            + Excel
+            <input type="file" id="prevExcelInput" accept=".xlsx,.xls" style="display:none;"
+              onchange="onExcelAdded(this)" />
+          </label>
+          <span id="excelFileName" style="font-size:12px; color:var(--green); font-weight:500;"></span>
+          <button id="excelClearBtn" onclick="clearExcel()"
+            style="display:none; background:none; border:none; color:var(--muted-2); cursor:pointer; font-size:14px; padding:0;">✕</button>
+        </div>
       </div>
       <div class="card-body">
 
@@ -927,6 +939,8 @@
           <div class="file-list-empty" id="fileListEmpty">No files added yet. Click <strong>+ Add PDF files</strong>
             above.</div>
         </div>
+
+
 
         <div class="action-row">
           <button class="btn-primary" id="extractBtn" onclick="doExtract()">
@@ -998,6 +1012,7 @@
 
   <script>
     let fileEntries = [];
+    let prevExcelFile = null;
     let extractedData = null;
     let currentView = "merged";
     let currentTab = 0;
@@ -1132,6 +1147,22 @@
 
     function removeFile(i) { fileEntries.splice(i, 1); renderFileList(); updateDropZone(); }
 
+    function onExcelAdded(input) {
+      if (input.files && input.files[0]) {
+        prevExcelFile = input.files[0];
+        document.getElementById("excelFileName").textContent = "✓ " + prevExcelFile.name;
+        document.getElementById("excelClearBtn").style.display = "inline-block";
+      }
+      input.value = "";
+    }
+
+    function clearExcel() {
+      prevExcelFile = null;
+      document.getElementById("excelFileName").textContent = "";
+      document.getElementById("excelClearBtn").style.display = "none";
+      document.getElementById("prevExcelInput").value = "";
+    }
+
     // ── Extract ───────────────────────────────────────────────────
     async function doExtract() {
       if (!fileEntries.length) { setStatus("Please add at least one PDF file.", "error"); return; }
@@ -1147,6 +1178,7 @@
 
       const fd = new FormData();
       fileEntries.forEach(e => { fd.append("pdfs", e.file); fd.append("passwords", e.password); });
+      if (prevExcelFile) { fd.append("prev_excel", prevExcelFile); }
 
       try {
         const res = await fetch("/extract_multi", { method: "POST", body: fd });

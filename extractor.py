@@ -1,1525 +1,3 @@
-# import pdfplumber
-# import pypdf
-# import pandas as pd
-# import re
-# import io
-# import os
-# import json
-# from dotenv import load_dotenv
-# from groq import Groq
-
-# load_dotenv()
-
-# def unlock_pdf(file_bytes, password):
-#     reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-#     if reader.is_encrypted:
-#         reader.decrypt(password)
-#     writer = pypdf.PdfWriter()
-#     for page in reader.pages:
-#         writer.add_page(page)
-#     unlocked = io.BytesIO()
-#     writer.write(unlocked)
-#     unlocked.seek(0)
-#     return unlocked
-
-# def is_date(text):
-#     return bool(re.match(r'^\d{2}[/\-\.]\d{2}[/\-\.]\d{2,4}$', str(text).strip()))
-
-# def is_amount(text):
-#     return bool(re.match(r'^[\d,]+\.\d{2}$', str(text).strip()))
-
-# def clean(val):
-#     return re.sub(r'\s+', ' ', str(val)).strip() if val else ""
-
-# def is_footer_row(cells):
-#     text = " ".join(cells).lower().replace(" ", "")
-#     keywords = [
-#         "statementsummary", "openingbalance", "generatedon", "generatedby",
-#         "closingbalanceincludes", "contentsofthis", "registeredoffice",
-#         "hdfcbanklimited", "hdfcbankgstin", "stateaccountbranch",
-#         "accountbranch", "accountno", "custid", "nomination",
-#         "bizpro", "jointholders", "drcount", "crcount"
-#     ]
-#     return any(kw in text for kw in keywords)
-
-# def try_extract_tables(page):
-#     strategies = [
-#         {"vertical_strategy": "lines", "horizontal_strategy": "lines"},
-#         {"vertical_strategy": "lines", "horizontal_strategy": "text"},
-#         {"vertical_strategy": "text",  "horizontal_strategy": "lines"},
-#         {"vertical_strategy": "text",  "horizontal_strategy": "text"},
-#     ]
-#     best = []
-#     best_score = -1
-
-#     for s in strategies:
-#         tables = page.extract_tables(s)
-#         all_rows = [row for t in tables for row in t if t]
-
-#         score = 0
-#         for row in all_rows:
-#             if not row:
-#                 continue
-#             cells = [re.sub(r'\s+', ' ', str(c)).strip() if c else "" for c in row]
-#             for i in range(min(2, len(cells))):
-#                 if re.match(r'^\d{2}[/\-\.]\d{2}[/\-\.]\d{2,4}', cells[i]):
-#                     score += 1
-#                     break
-
-#         effective_score = score * 1000 + len(all_rows)
-#         if effective_score > best_score:
-#             best = all_rows
-#             best_score = effective_score
-
-#     return best
-
-# def detect_transaction(cells):
-#     c0 = clean(cells[0]) if len(cells) > 0 else ""
-#     c1 = clean(cells[1]) if len(cells) > 1 else ""
-
-#     if c0 == "" or c0 == "None":
-#         match = re.match(r'^(\d{2}[/\-\.]\d{2}[/\-\.]\d{2,4})\s+(\S.*)', c1)
-#         if match:
-#             return match.group(1), match.group(2), 2
-
-#     if is_date(c0) and c1 and not is_amount(c1) and not is_date(c1):
-#         return c0, c1, 2
-
-#     match = re.match(r'^(\d{2}[/\-\.]\d{2}[/\-\.]\d{2,4})\s+(\S*)', c0)
-#     if match:
-#         partial = match.group(2)
-#         narration = partial + c1
-#         return match.group(1), narration, 2
-
-#     return None, None, None
-
-# def extract_amounts(cells):
-#     indexed_amounts = []
-#     for i, cell in enumerate(cells):
-#         v = clean(cell)
-#         for part in v.split():
-#             if is_amount(part):
-#                 indexed_amounts.append((i, part))
-
-#     if not indexed_amounts:
-#         return "", "", ""
-
-#     closing = indexed_amounts[-1][1]
-
-#     if len(indexed_amounts) == 1:
-#         return "", "", closing
-#     elif len(indexed_amounts) >= 3:
-#         return indexed_amounts[0][1], indexed_amounts[1][1], closing
-#     else:
-#         return indexed_amounts[0][1], "", closing
-
-# def fallback_shorten(narration):
-#     if not narration:
-#         return ""
-#     cleaned = re.sub(r'[0-9@#\.\-\_\/]', ' ', narration.upper())
-#     words = [w for w in cleaned.split() if len(w) > 2][:4]
-#     return " ".join(words).title() if words else narration[:30].title()
-
-# def process_narrations_batch(narrations):
-#     """
-#     Single Groq API call that returns short narration, GST tag, and category.
-#     Returns three lists: (short_narrations, gst_tags, categories)
-#     """
-#     api_key = os.getenv("GROQ_API_KEY")
-#     if not api_key:
-#         print("No GROQ_API_KEY found, using fallback")
-#         return [fallback_shorten(n) for n in narrations], ["No GST"] * len(narrations), [""] * len(narrations)
-
-#     client = Groq(api_key=api_key)
-#     narration_list = "\n".join([f"{i+1}. {n}" for i, n in enumerate(narrations)])
-
-#     prompt = f"""You are an expert Indian bank transaction analyst.
-
-# For each bank transaction narration, provide three things:
-# 1. A short human-readable description (max 5 words)
-# 2. Whether the transaction involves GST or not
-# 3. A meaningful business category describing the purpose of the transaction
-
-# SHORT DESCRIPTION RULES:
-# - Use formats like: "UPI to [Name]", "NEFT from [Name]", "NEFT to [Name]", "Cheque to [Name]", "ATM Withdrawal", "Salary Credit", "EMI Payment"
-# - Extract actual person or business name where possible
-# - Remove all reference numbers, bank codes, transaction IDs
-# - If known service use that name directly
-
-# CATEGORY RULES:
-# - Write a short meaningful business purpose (3-6 words)
-# - Be specific and descriptive based on what you can infer from the narration
-# - Do not just repeat the short description
-
-# GST RULES:
-# TRANSACTIONS WITH GST:
-# - Payment to any registered business for goods or services
-# - Online shopping, food delivery, travel, hotels, flights
-# - Telecom & internet bills, utility bills
-# - Software & streaming subscriptions
-# - Professional services
-# - Any company with PVT, LTD, LLP, CORP, ENTERPRISE, INDUSTRIES, TRADERS, SOLUTIONS, SERVICES, TECHNOLOGIES
-# - Payment via payment gateway (PAYU, RAZORPAY, BILLDESK, CCAVENUE, EASEBUZZ)
-
-# TRANSACTIONS WITHOUT GST:
-# - Transfer to an individual person
-# - Salary, residential rent, loan EMI, insurance premium
-# - Mutual fund, SIP, stock investments
-# - ATM withdrawals, income tax, TDS, government payments
-# - Person to person transfers
-
-# HOW TO IDENTIFY INDIVIDUAL VS BUSINESS:
-# - Personal name (common first+last name) = individual = No GST
-# - Business keywords (PVT, LTD, STORE, MART, SHOP, HOSPITAL) = GST
-# - Payment gateways (PAYU, RAZORPAY) = always GST
-# - If unclear, default to No GST
-
-# Respond ONLY with a valid JSON array with exactly {len(narrations)} objects.
-# Each object must have exactly three keys: "short", "gst", "category".
-# "gst" must be exactly "GST" or "No GST".
-# No explanation, no extra text, just the raw JSON array.
-
-# Example:
-# [
-#   {{"short": "NEFT to Raj Kumar", "gst": "No GST", "category": "Salary payment"}},
-#   {{"short": "NEFT from Bilal Majbour", "gst": "No GST", "category": "Export software contract"}},
-#   {{"short": "Cheque to Titan", "gst": "GST", "category": "Watch purchase for client"}},
-#   {{"short": "UPI to Swiggy", "gst": "GST", "category": "Food delivery"}}
-# ]
-
-# Transactions to analyze:
-# {narration_list}"""
-
-#     try:
-#         response = client.chat.completions.create(
-#             model="llama-3.3-70b-versatile",
-#             messages=[{"role": "user", "content": prompt}],
-#             temperature=0,
-#         )
-
-#         content = response.choices[0].message.content.strip()
-#         match = re.search(r'\[.*?\]', content, re.DOTALL)
-#         if match:
-#             result = json.loads(match.group())
-#             if len(result) == len(narrations):
-#                 short_narrations = [str(r.get("short", "")).strip() for r in result]
-#                 gst_tags = ["GST" if str(r.get("gst", "")).strip().upper() == "GST" else "No GST" for r in result]
-#                 categories = [str(r.get("category", "")).strip() for r in result]
-#                 return short_narrations, gst_tags, categories
-
-#         print(f"Groq parse failed: {content}")
-#         return [fallback_shorten(n) for n in narrations], ["No GST"] * len(narrations), [""] * len(narrations)
-
-#     except Exception as e:
-#         print(f"Groq API error: {e}")
-#         return [fallback_shorten(n) for n in narrations], ["No GST"] * len(narrations), [""] * len(narrations)
-
-# def classify_amounts(transactions):
-#     def parse_num(s):
-#         try:
-#             return float(s.replace(",", ""))
-#         except:
-#             return None
-
-#     def guess_from_narration(narration):
-#         n = str(narration).upper()
-#         if any(x in n for x in ["NEFTCR", "RTGSCR", "IMPS CR", "CR-", "/CR", "CREDIT"]):
-#             return "deposit"
-#         if any(x in n for x in ["NEFTDR", "RTGSDR", "IMPS DR", "DR-", "/DR", "DEBIT"]):
-#             return "withdrawal"
-#         return None
-
-#     for i, txn in enumerate(transactions):
-#         # 0=date, 1=narration, 2=short, 3=chq, 4=valuedt, 5=withdrawal, 6=deposit, 7=closing
-#         narration  = txn[1]
-#         withdrawal = txn[5]
-#         deposit    = txn[6]
-#         closing    = txn[7]
-
-#         if withdrawal and deposit:
-#             continue
-
-#         amount = withdrawal or deposit
-#         if not amount:
-#             continue
-
-#         direction = None
-
-#         if i == 0:
-#             direction = guess_from_narration(narration)
-#             if direction is None:
-#                 direction = "deposit"
-#         else:
-#             prev_closing = parse_num(transactions[i-1][7])
-#             curr_closing = parse_num(closing)
-#             if prev_closing is not None and curr_closing is not None:
-#                 direction = "withdrawal" if curr_closing < prev_closing else "deposit"
-
-#         if direction == "withdrawal":
-#             transactions[i][5] = amount
-#             transactions[i][6] = ""
-#         elif direction == "deposit":
-#             transactions[i][5] = ""
-#             transactions[i][6] = amount
-
-#     return transactions
-
-# def extract_transactions(file_bytes, password=""):
-#     unlocked_pdf = unlock_pdf(file_bytes, password)
-
-#     transactions = []
-#     header_found = False
-#     in_transaction_section = False
-
-#     with pdfplumber.open(unlocked_pdf) as pdf:
-#         for page_num, page in enumerate(pdf.pages):
-#             rows = try_extract_tables(page)
-
-#             for row in rows:
-#                 if not row:
-#                     continue
-
-#                 cells = [clean(c) for c in row]
-
-#                 if all(c == "" or c == "None" for c in cells):
-#                     continue
-
-#                 row_text = " ".join(cells).lower()
-
-#                 if "date" in row_text and "narration" in row_text:
-#                     header_found = True
-#                     in_transaction_section = True
-#                     continue
-
-#                 if not header_found:
-#                     continue
-
-#                 non_empty = [c for c in cells if c and c != "None"]
-#                 if non_empty and is_footer_row(cells):
-#                     in_transaction_section = False
-#                     continue
-
-#                 date, narration, rest_start = detect_transaction(cells)
-#                 if date and not in_transaction_section:
-#                     in_transaction_section = True
-
-#                 if not in_transaction_section:
-#                     continue
-
-#                 if date:
-#                     remaining = cells[rest_start:]
-#                     chq_parts = []
-#                     valuedt = ""
-#                     amount_start = 0
-
-#                     for j, val in enumerate(remaining):
-#                         v = clean(val)
-#                         if is_date(v):
-#                             valuedt = v
-#                             amount_start = j + 1
-#                             break
-#                         elif is_amount(v):
-#                             amount_start = j
-#                             break
-#                         elif v and v != "None":
-#                             chq_parts.append(v)
-
-#                     chq = "".join(chq_parts)
-#                     amount_cells = remaining[amount_start:]
-#                     withdrawal, deposit, closing = extract_amounts(amount_cells)
-
-#                     # 0=date,1=narration,2=short,3=chq,4=valuedt,5=withdrawal,6=deposit,7=closing
-#                     transactions.append([date, narration, "", chq, valuedt, withdrawal, deposit, closing])
-
-#                 elif transactions:
-#                     for c in cells:
-#                         v = clean(c)
-#                         if v and v not in ("None", "") and not is_amount(v) and not is_date(v) and len(v) > 2:
-#                             transactions[-1][1] += " " + v
-#                             break
-
-#     if not transactions:
-#         return None, "No transactions found"
-
-#     transactions = [list(t) for t in transactions]
-#     transactions = classify_amounts(transactions)
-
-#     # Single API call for short narration, GST tag, and category
-#     narrations = [t[1] for t in transactions]
-#     short_narrations, gst_tags, categories = process_narrations_batch(narrations)
-
-#     # Build final rows — Dr/Cr + Amount, no ClosingBalance
-#     final_transactions = []
-#     for i, t in enumerate(transactions):
-#         date       = t[0]
-#         narration  = t[1]
-#         short      = short_narrations[i]
-#         chq        = t[3]
-#         valuedt    = t[4]
-#         withdrawal = t[5]
-#         deposit    = t[6]
-#         # t[7] = closing — excluded from output
-#         gst        = gst_tags[i]
-#         category   = categories[i]
-
-#         if withdrawal:
-#             dr_cr  = "Dr"
-#             amount = withdrawal
-#         else:
-#             dr_cr  = "Cr"
-#             amount = deposit
-
-#         final_transactions.append([date, narration, short, chq, valuedt, dr_cr, amount, gst, category])
-
-#     clean_header = ["Date", "Narration", "Narration(Short)", "Chq./Ref.No.", "ValueDt", "Dr/Cr", "Amount(₹)", "GST", "Category"]
-#     df = pd.DataFrame(final_transactions, columns=clean_header)
-#     df = df.map(lambda x: re.sub(r'\s+', ' ', str(x)).strip() if x else "")
-#     df = df[df["Date"].apply(is_date)]
-#     df.reset_index(drop=True, inplace=True)
-
-#     return df, None
-
-
-
-
-
-
-
-
-
-# import pdfplumber
-# import pypdf
-# import pandas as pd
-# import re
-# import io
-# import os
-# import json
-# from dotenv import load_dotenv
-# from groq import Groq
-
-# load_dotenv()
-
-# def unlock_pdf(file_bytes, password):
-#     reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-#     if reader.is_encrypted:
-#         reader.decrypt(password)
-#     writer = pypdf.PdfWriter()
-#     for page in reader.pages:
-#         writer.add_page(page)
-#     unlocked = io.BytesIO()
-#     writer.write(unlocked)
-#     unlocked.seek(0)
-#     return unlocked
-
-# def is_date(text):
-#     return bool(re.match(r'^\d{2}[/\-\.]\d{2}[/\-\.]\d{2,4}$', str(text).strip()))
-
-# def is_amount(text):
-#     return bool(re.match(r'^[\d,]+\.\d{2}$', str(text).strip()))
-
-# def clean(val):
-#     return re.sub(r'\s+', ' ', str(val)).strip() if val else ""
-
-# def fallback_shorten(narration):
-#     if not narration:
-#         return ""
-#     cleaned = re.sub(r'[0-9@#\.\-\_\/]', ' ', narration.upper())
-#     words = [w for w in cleaned.split() if len(w) > 2][:4]
-#     return " ".join(words).title() if words else narration[:30].title()
-
-# def extract_text_from_pdf(file_bytes, password=""):
-#     """Extract raw text from all pages of PDF."""
-#     unlocked = unlock_pdf(file_bytes, password)
-#     pages_text = []
-#     with pdfplumber.open(unlocked) as pdf:
-#         for page in pdf.pages:
-#             text = page.extract_text()
-#             if text:
-#                 pages_text.append(text.strip())
-#     return pages_text
-
-# def parse_transactions_with_groq(pages_text):
-#     api_key = os.getenv("GROQ_API_KEY")
-#     if not api_key:
-#         return None, "No GROQ_API_KEY found in .env"
-
-#     client = Groq(api_key=api_key)
-#     full_text = "\n\n--- PAGE BREAK ---\n\n".join(pages_text)
-
-#     if len(full_text) > 12000:
-#         full_text = full_text[:12000]
-
-#     prompt = f"""You are an expert at reading Indian bank statement PDFs.
-
-# Extract ALL transactions from the following bank statement text.
-
-# RULES:
-# - Extract every single transaction row, do not skip any
-# - Date format in output must be DD/MM/YY or DD/MM/YYYY
-# - Amount must be a number with 2 decimal places like 1000.00 or 1,00,000.00
-# - dr_cr must be exactly "Dr" if money went OUT of account, "Cr" if money came IN
-# - narration is the full transaction description as it appears
-# - chq_ref is the cheque number or reference number if present, else empty string
-# - value_dt is the value date if present, else empty string
-# - Ignore header rows, footer rows, summary rows, opening balance rows
-# - Only include actual transaction rows
-
-# Respond ONLY with a valid JSON array. No explanation, no extra text.
-
-# Each object must have exactly these keys:
-# - "date": transaction date as string
-# - "narration": full narration as string
-# - "chq_ref": cheque/reference number as string
-# - "value_dt": value date as string
-# - "dr_cr": "Dr" or "Cr"
-# - "amount": amount as string with 2 decimals
-
-# Bank statement text:
-# {full_text}"""
-
-#     try:
-#         response = client.chat.completions.create(
-#             model="llama-3.3-70b-versatile",
-#             messages=[{"role": "user", "content": prompt}],
-#             temperature=0,
-#             max_tokens=8000,
-#         )
-
-#         content = response.choices[0].message.content.strip()
-#         print(f"Groq extraction response length: {len(content)}")
-
-#         # Greedy match to get full array
-#         match = re.search(r'\[.*\]', content, re.DOTALL)
-#         if match:
-#             raw = match.group()
-#             try:
-#                 result = json.loads(raw)
-#             except json.JSONDecodeError:
-#                 # Fix truncated JSON — trim to last complete object
-#                 last_brace = raw.rfind('},')
-#                 if last_brace != -1:
-#                     raw = raw[:last_brace + 1] + ']'
-#                     try:
-#                         result = json.loads(raw)
-#                     except:
-#                         return None, "Groq returned truncated JSON, try a shorter statement"
-#                 else:
-#                     return None, f"Groq could not parse transactions: {content[:200]}"
-
-#             if isinstance(result, list) and len(result) > 0:
-#                 print(f"Parsed {len(result)} transactions")
-#                 return result, None
-
-#         return None, f"Groq could not parse transactions: {content[:200]}"
-
-#     except Exception as e:
-#         return None, f"Groq API error: {str(e)}"
-
-# def process_narrations_batch(narrations):
-#     """
-#     Single Groq API call for short narration, GST tag, and category.
-#     Returns three lists: (short_narrations, gst_tags, categories)
-#     """
-#     api_key = os.getenv("GROQ_API_KEY")
-#     if not api_key:
-#         return [fallback_shorten(n) for n in narrations], ["No GST"] * len(narrations), [""] * len(narrations)
-
-#     client = Groq(api_key=api_key)
-#     narration_list = "\n".join([f"{i+1}. {n}" for i, n in enumerate(narrations)])
-
-#     prompt = f"""You are an expert Indian bank transaction analyst.
-
-# For each bank transaction narration, provide three things:
-# 1. A short human-readable description (max 5 words)
-# 2. Whether the transaction involves GST or not
-# 3. A meaningful business category describing the purpose of the transaction
-
-# SHORT DESCRIPTION RULES:
-# - Use formats like: "UPI to [Name]", "NEFT from [Name]", "NEFT to [Name]", "Cheque to [Name]", "ATM Withdrawal", "Salary Credit", "EMI Payment"
-# - Extract actual person or business name where possible
-# - Remove all reference numbers, bank codes, transaction IDs
-# - If known service use that name directly
-
-# CATEGORY RULES:
-# - Write a short meaningful business purpose (3-6 words)
-# - Be specific and descriptive based on what you can infer from the narration
-# - Do not just repeat the short description
-
-# GST RULES:
-# TRANSACTIONS WITH GST:
-# - Payment to any registered business for goods or services
-# - Online shopping, food delivery, travel, hotels, flights
-# - Telecom & internet bills, utility bills
-# - Software & streaming subscriptions
-# - Professional services
-# - Any company with PVT, LTD, LLP, CORP, ENTERPRISE, INDUSTRIES, TRADERS, SOLUTIONS, SERVICES, TECHNOLOGIES
-# - Payment via payment gateway (PAYU, RAZORPAY, BILLDESK, CCAVENUE, EASEBUZZ)
-
-# TRANSACTIONS WITHOUT GST:
-# - Transfer to an individual person
-# - Salary, residential rent, loan EMI, insurance premium
-# - Mutual fund, SIP, stock investments
-# - ATM withdrawals, income tax, TDS, government payments
-# - Person to person transfers
-
-# HOW TO IDENTIFY INDIVIDUAL VS BUSINESS:
-# - Personal name (common first+last name) = individual = No GST
-# - Business keywords (PVT, LTD, STORE, MART, SHOP, HOSPITAL) = GST
-# - Payment gateways (PAYU, RAZORPAY) = always GST
-# - If unclear, default to No GST
-
-# Respond ONLY with a valid JSON array with exactly {len(narrations)} objects.
-# Each object must have exactly three keys: "short", "gst", "category".
-# "gst" must be exactly "GST" or "No GST".
-# No explanation, no extra text, just the raw JSON array.
-
-# Example:
-# [
-#   {{"short": "NEFT to Raj Kumar", "gst": "No GST", "category": "Salary payment"}},
-#   {{"short": "NEFT from Bilal Majbour", "gst": "No GST", "category": "Export software contract"}},
-#   {{"short": "Cheque to Titan", "gst": "GST", "category": "Watch purchase for client"}},
-#   {{"short": "UPI to Swiggy", "gst": "GST", "category": "Food delivery"}}
-# ]
-
-# Transactions to analyze:
-# {narration_list}"""
-
-#     try:
-#         response = client.chat.completions.create(
-#             model="llama-3.3-70b-versatile",
-#             messages=[{"role": "user", "content": prompt}],
-#             temperature=0,
-#         )
-
-#         content = response.choices[0].message.content.strip()
-#         match = re.search(r'\[.*?\]', content, re.DOTALL)
-#         if match:
-#             result = json.loads(match.group())
-#             if isinstance(result, list) and len(result) > 0:
-#                 while len(result) < len(narrations):
-#                     result.append({"short": "-", "gst": "No GST", "category": "-"})
-#                 result = result[:len(narrations)]
-#                 short_narrations = [str(r.get("short", "-")).strip() or "-" for r in result]
-#                 gst_tags = ["GST" if str(r.get("gst", "")).strip().upper() == "GST" else "No GST" for r in result]
-#                 categories = [str(r.get("category", "-")).strip() or "-" for r in result]
-#                 return short_narrations, gst_tags, categories
-
-#         print(f"Groq parse failed: {content}")
-#         return [fallback_shorten(n) for n in narrations], ["No GST"] * len(narrations), [""] * len(narrations)
-
-#     except Exception as e:
-#         print(f"Groq API error: {e}")
-#         return [fallback_shorten(n) for n in narrations], ["No GST"] * len(narrations), [""] * len(narrations)
-
-# def extract_transactions(file_bytes, password=""):
-#     # Step 1: Extract raw text from PDF
-#     pages_text = extract_text_from_pdf(file_bytes, password)
-#     if not pages_text:
-#         return None, "Could not extract text from PDF"
-
-#     # Step 2: Use Groq to parse transactions from raw text
-#     raw_transactions, error = parse_transactions_with_groq(pages_text)
-#     if error:
-#         return None, error
-#     if not raw_transactions:
-#         return None, "No transactions found"
-
-#     print(f"Groq extracted {len(raw_transactions)} transactions")
-
-#     # Step 3: Process narrations with Groq (short, GST, category)
-#     narrations = [t.get("narration", "") for t in raw_transactions]
-#     short_narrations, gst_tags, categories = process_narrations_batch(narrations)
-
-#     # Build final output
-#     final_transactions = []
-#     for i, t in enumerate(raw_transactions):
-#         date     = clean(t.get("date", ""))
-#         narration= clean(t.get("narration", ""))
-#         chq      = clean(t.get("chq_ref", "")) or "-"
-#         dr_cr    = clean(t.get("dr_cr", ""))
-#         amount   = clean(t.get("amount", "")) or "-"
-#         short    = short_narrations[i] or "-"
-#         gst      = gst_tags[i] or "-"
-#         category = categories[i] or "-"
-
-#         # Normalize dr_cr
-#         if dr_cr.upper() in ["DR", "DEBIT", "D"]:
-#             dr_cr = "Dr"
-#         elif dr_cr.upper() in ["CR", "CREDIT", "C"]:
-#             dr_cr = "Cr"
-#         else:
-#             dr_cr = "-"
-
-#         # ValueDt removed from output
-#         final_transactions.append([date, narration, short, chq, dr_cr, amount, gst, category])
-
-#     clean_header = ["Date", "Narration", "Narration(Short)", "Chq./Ref.No.", "Dr/Cr", "Amount(₹)", "GST", "Category"]
-#     df = pd.DataFrame(final_transactions, columns=clean_header)
-#     df = df.map(lambda x: re.sub(r'\s+', ' ', str(x)).strip() if x else "")
-#     df = df[df["Date"].apply(is_date)]
-#     df.reset_index(drop=True, inplace=True)
-
-#     if df.empty:
-#         return None, "No valid transactions found after filtering"
-
-#     return df, None
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# import pdfplumber
-# import pypdf
-# import pandas as pd
-# import re
-# import io
-# import os
-# import json
-# import time
-# import google.generativeai as genai
-# from dotenv import load_dotenv
-
-# load_dotenv()
-
-# genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-# model = genai.GenerativeModel("gemini-2.0-flash-lite")
-
-# def unlock_pdf(file_bytes, password):
-#     reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-#     if reader.is_encrypted:
-#         reader.decrypt(password)
-#     writer = pypdf.PdfWriter()
-#     for page in reader.pages:
-#         writer.add_page(page)
-#     unlocked = io.BytesIO()
-#     writer.write(unlocked)
-#     unlocked.seek(0)
-#     return unlocked
-
-# def is_date(text):
-#     return bool(re.match(r'^\d{2}[/\-\.]\d{2}[/\-\.]\d{2,4}$', str(text).strip()))
-
-# def is_amount(text):
-#     return bool(re.match(r'^[\d,]+\.\d{2}$', str(text).strip()))
-
-# def clean(val):
-#     return re.sub(r'\s+', ' ', str(val)).strip() if val else ""
-
-# def fallback_shorten(narration):
-#     if not narration:
-#         return ""
-#     cleaned = re.sub(r'[0-9@#\.\-\_\/]', ' ', narration.upper())
-#     words = [w for w in cleaned.split() if len(w) > 2][:4]
-#     return " ".join(words).title() if words else narration[:30].title()
-
-# def call_gemini(prompt):
-#     response = model.generate_content(
-#         prompt,
-#         generation_config=genai.GenerationConfig(temperature=0)
-#     )
-#     return response.text.strip()
-
-# def extract_page_structured(page):
-#     strategies = [
-#         {"vertical_strategy": "lines", "horizontal_strategy": "lines"},
-#         {"vertical_strategy": "lines", "horizontal_strategy": "text"},
-#         {"vertical_strategy": "text",  "horizontal_strategy": "lines"},
-#         {"vertical_strategy": "text",  "horizontal_strategy": "text"},
-#     ]
-
-#     best_tables = []
-#     best_score = -1
-
-#     for s in strategies:
-#         tables = page.extract_tables(s)
-#         if not tables:
-#             continue
-#         all_rows = [row for t in tables for row in t if t]
-#         score = sum(
-#             1 for row in all_rows
-#             if row and any(
-#                 re.match(r'^\d{2}[/\-\.]\d{2}[/\-\.]\d{2,4}', str(c or "").strip())
-#                 for c in row[:3]
-#             )
-#         )
-#         if score > best_score:
-#             best_tables = all_rows
-#             best_score = score
-
-#     if not best_tables:
-#         return []
-
-#     col_map = {}
-#     col_keywords = {
-#         "date":       ["date", "txn date", "tran date", "transaction date", "posting date", "value date"],
-#         "narration":  ["narration", "particulars", "description", "details", "remarks", "transaction details"],
-#         "ref":        ["chq", "ref", "cheque", "reference", "chq./ref", "utr", "transaction id", "txn id"],
-#         "withdrawal": ["withdrawal", "debit", "dr", "debit amount", "withdrawal amt", "paid out", "amount dr"],
-#         "deposit":    ["deposit", "credit", "cr", "credit amount", "deposit amt", "paid in", "amount cr"],
-#         "closing":    ["balance", "closing", "running balance", "available balance", "closing balance"],
-#     }
-
-#     for row in best_tables[:8]:
-#         if not row:
-#             continue
-#         cells = [str(c or "").lower().strip() for c in row]
-#         has_date = any("date" in c for c in cells)
-#         has_narr = any(
-#             any(kw in c for kw in ["narration", "particular", "description", "details"])
-#             for c in cells
-#         )
-#         if has_date and has_narr:
-#             for col_type, keywords in col_keywords.items():
-#                 for idx, cell in enumerate(cells):
-#                     if any(kw in cell for kw in keywords):
-#                         if col_type not in col_map:
-#                             col_map[col_type] = idx
-#             break
-
-#     if not col_map:
-#         for row in best_tables[:5]:
-#             if not row:
-#                 continue
-#             cells = [str(c or "").strip() for c in row]
-
-#             date_idx = None
-#             for idx, c in enumerate(cells[:3]):
-#                 if re.match(r'^\d{2}[/\-\.]\d{2}[/\-\.]\d{2,4}', c):
-#                     date_idx = idx
-#                     break
-#             if date_idx is None:
-#                 continue
-
-#             amount_indices = [
-#                 idx for idx, c in enumerate(cells)
-#                 if re.match(r'^[\d,]+\.\d{2}$', c.replace('-', '').strip())
-#                 and c.strip() not in ('', '-')
-#             ]
-
-#             narr_idx = None
-#             for idx in range(date_idx + 1, len(cells)):
-#                 c = cells[idx]
-#                 if (c and c != '-'
-#                         and not re.match(r'^\d{2}[/\-\.]\d{2}[/\-\.]\d{2,4}', c)
-#                         and not re.match(r'^[\d,]+\.\d{2}$', c)
-#                         and len(c) > 5):
-#                     narr_idx = idx
-#                     break
-
-#             ref_idx = None
-#             if narr_idx is not None:
-#                 for idx in range(narr_idx + 1, len(cells)):
-#                     c = cells[idx]
-#                     if c and c != '-' and not re.match(r'^[\d,]+\.\d{2}$', c):
-#                         ref_idx = idx
-#                         break
-
-#             if len(amount_indices) >= 3:
-#                 col_map["withdrawal"] = amount_indices[-3]
-#                 col_map["deposit"]    = amount_indices[-2]
-#                 col_map["closing"]    = amount_indices[-1]
-#             elif len(amount_indices) == 2:
-#                 col_map["deposit"]  = amount_indices[-2]
-#                 col_map["closing"]  = amount_indices[-1]
-#             elif len(amount_indices) == 1:
-#                 col_map["closing"]  = amount_indices[-1]
-
-#             if date_idx  is not None: col_map["date"]      = date_idx
-#             if narr_idx  is not None: col_map["narration"] = narr_idx
-#             if ref_idx   is not None: col_map["ref"]       = ref_idx
-#             break
-
-#     structured_lines = []
-
-#     for row in best_tables:
-#         if not row:
-#             continue
-#         cells = [str(c or "").strip() for c in row]
-
-#         row_text = " ".join(cells).lower()
-#         if any(kw in row_text for kw in ["narration", "particulars", "description"]) and \
-#            any(kw in row_text for kw in ["date", "withdrawal", "deposit", "debit", "credit"]):
-#             continue
-
-#         date_val = ""
-#         if "date" in col_map and col_map["date"] < len(cells):
-#             date_val = cells[col_map["date"]]
-#         else:
-#             for c in cells[:3]:
-#                 if re.match(r'^\d{2}[/\-\.]\d{2}[/\-\.]\d{2,4}', c):
-#                     date_val = c
-#                     break
-
-#         if not date_val:
-#             continue
-
-#         def get_col(col_type):
-#             if col_type in col_map and col_map[col_type] < len(cells):
-#                 return cells[col_map[col_type]]
-#             return ""
-
-#         narr_val  = get_col("narration") or (cells[1] if len(cells) > 1 else "")
-#         ref_val   = get_col("ref")
-#         wd_val    = get_col("withdrawal")
-#         dep_val   = get_col("deposit")
-#         close_val = get_col("closing")
-
-#         narr_val = re.sub(r'\s+', ' ', narr_val).strip()
-
-#         if not ref_val or ref_val == '-':
-#             for c in cells:
-#                 if re.match(r'^[A-Z0-9]{10,}$', c.strip()):
-#                     ref_val = c.strip()
-#                     break
-
-#         wd_val    = "" if wd_val    in ("-", "None") else wd_val
-#         dep_val   = "" if dep_val   in ("-", "None") else dep_val
-#         close_val = "" if close_val in ("-", "None") else close_val
-
-#         line = (f"DATE={date_val} | NARRATION={narr_val} | REF={ref_val} | "
-#                 f"WITHDRAWAL={wd_val} | DEPOSIT={dep_val} | CLOSING={close_val}")
-#         structured_lines.append(line)
-
-#     return structured_lines
-
-# def extract_text_from_pdf(file_bytes, password=""):
-#     unlocked = unlock_pdf(file_bytes, password)
-#     pages_text = []
-#     with pdfplumber.open(unlocked) as pdf:
-#         for page in pdf.pages:
-#             lines = extract_page_structured(page)
-#             if lines:
-#                 pages_text.append("\n".join(lines))
-#             else:
-#                 text = page.extract_text()
-#                 if text:
-#                     pages_text.append(text.strip())
-#     return pages_text
-
-# def parse_page_with_gemini(page_text, page_num):
-#     prompt = f"""You are an expert at reading bank statement data from any bank.
-
-# The data below has clearly labeled columns:
-# DATE= | NARRATION= | REF= | WITHDRAWAL= | DEPOSIT= | CLOSING=
-
-# Extract ALL transactions following these rules:
-# - date: use the DATE= value exactly
-# - narration: use the NARRATION= value exactly as given
-# - chq_ref: use the REF= value, empty string if blank
-# - dr_cr: if WITHDRAWAL= has a number → "Dr", if DEPOSIT= has a number → "Cr"
-# - amount: if WITHDRAWAL= has a number use it, else use DEPOSIT= value
-# - Do NOT use CLOSING= as the amount — that is the running balance
-# - Skip rows where both WITHDRAWAL= and DEPOSIT= are empty
-# - If no transactions found on this page return []
-
-# Respond ONLY with a valid JSON array. No explanation, no extra text, no markdown.
-
-# Each object must have exactly these keys:
-# - "date": string
-# - "narration": string
-# - "chq_ref": string or empty string
-# - "dr_cr": "Dr" or "Cr"
-# - "amount": string with 2 decimals
-
-# Page {page_num + 1} data:
-# {page_text}"""
-
-#     try:
-#         content = call_gemini(prompt)
-#         content = re.sub(r'^```(?:json)?\s*', '', content)
-#         content = re.sub(r'\s*```$', '', content)
-#         match = re.search(r'\[.*\]', content, re.DOTALL)
-#         if match:
-#             raw = match.group()
-#             try:
-#                 result = json.loads(raw)
-#             except json.JSONDecodeError:
-#                 last_brace = raw.rfind('},')
-#                 if last_brace != -1:
-#                     raw = raw[:last_brace + 1] + ']'
-#                     try:
-#                         result = json.loads(raw)
-#                     except:
-#                         print(f"Page {page_num + 1}: could not fix truncated JSON")
-#                         return []
-#                 else:
-#                     return []
-
-#             if isinstance(result, list):
-#                 print(f"Page {page_num + 1}: found {len(result)} transactions")
-#                 return result
-
-#         print(f"Page {page_num + 1}: no transactions found")
-#         return []
-
-#     except Exception as e:
-#         print(f"Page {page_num + 1} Gemini error: {e}")
-#         return []
-
-# def process_narrations_batch(narrations):
-#     if not os.getenv("GEMINI_API_KEY"):
-#         return [fallback_shorten(n) for n in narrations], ["No GST"] * len(narrations), ["-"] * len(narrations)
-
-#     narration_list = "\n".join([f"{i+1}. {n}" for i, n in enumerate(narrations)])
-
-#     prompt = f"""You are an expert Indian bank transaction analyst.
-
-# For each bank transaction narration, provide three things:
-# 1. A short human-readable description (max 5 words)
-# 2. Whether the transaction involves GST or not
-# 3. A meaningful business category describing the purpose of the transaction
-
-# SHORT DESCRIPTION RULES:
-# - Use formats like: "UPI to [Name]", "NEFT from [Name]", "NEFT to [Name]", "Cheque to [Name]", "ATM Withdrawal", "Salary Credit", "EMI Payment"
-# - Extract actual person or business name where possible
-# - Remove all reference numbers, bank codes, transaction IDs
-# - If known service use that name directly
-
-# CATEGORY RULES:
-# - Write a short meaningful business purpose (3-6 words)
-# - Be specific and descriptive based on what you can infer from the narration
-# - Do not just repeat the short description
-
-# GST RULES:
-# TRANSACTIONS WITH GST:
-# - Payment to any registered business for goods or services
-# - Online shopping, food delivery, travel, hotels, flights
-# - Telecom & internet bills, utility bills
-# - Software & streaming subscriptions
-# - Professional services
-# - Any company with PVT, LTD, LLP, CORP, ENTERPRISE, INDUSTRIES, TRADERS, SOLUTIONS, SERVICES, TECHNOLOGIES
-# - Payment via payment gateway (PAYU, RAZORPAY, BILLDESK, CCAVENUE, EASEBUZZ)
-
-# TRANSACTIONS WITHOUT GST:
-# - Transfer to an individual person
-# - Salary, residential rent, loan EMI, insurance premium
-# - Mutual fund, SIP, stock investments
-# - ATM withdrawals, income tax, TDS, government payments
-# - Person to person transfers
-
-# HOW TO IDENTIFY INDIVIDUAL VS BUSINESS:
-# - Personal name (common first+last name) = individual = No GST
-# - Business keywords (PVT, LTD, STORE, MART, SHOP, HOSPITAL) = GST
-# - Payment gateways (PAYU, RAZORPAY) = always GST
-# - If unclear, default to No GST
-
-# IMPORTANT: You MUST return exactly {len(narrations)} objects in the array, one for each transaction.
-
-# Respond ONLY with a valid JSON array with exactly {len(narrations)} objects.
-# Each object must have exactly three keys: "short", "gst", "category".
-# "gst" must be exactly "GST" or "No GST".
-# No explanation, no extra text, no markdown, just the raw JSON array.
-
-# Transactions to analyze:
-# {narration_list}"""
-
-#     try:
-#         content = call_gemini(prompt)
-#         content = re.sub(r'^```(?:json)?\s*', '', content)
-#         content = re.sub(r'\s*```$', '', content)
-#         match = re.search(r'\[.*\]', content, re.DOTALL)
-#         if match:
-#             raw = match.group()
-#             try:
-#                 result = json.loads(raw)
-#             except json.JSONDecodeError:
-#                 last_brace = raw.rfind('},')
-#                 if last_brace != -1:
-#                     raw = raw[:last_brace + 1] + ']'
-#                     try:
-#                         result = json.loads(raw)
-#                     except:
-#                         result = []
-#                 else:
-#                     result = []
-
-#             if isinstance(result, list) and len(result) > 0:
-#                 while len(result) < len(narrations):
-#                     result.append({"short": "-", "gst": "No GST", "category": "-"})
-#                 result = result[:len(narrations)]
-#                 short_narrations = [str(r.get("short", "-")).strip() or "-" for r in result]
-#                 gst_tags = ["GST" if str(r.get("gst", "")).strip().upper() == "GST" else "No GST" for r in result]
-#                 categories = [str(r.get("category", "-")).strip() or "-" for r in result]
-#                 return short_narrations, gst_tags, categories
-
-#         print(f"Gemini narration parse failed: {content[:200]}")
-#         return [fallback_shorten(n) for n in narrations], ["No GST"] * len(narrations), ["-"] * len(narrations)
-
-#     except Exception as e:
-#         print(f"Gemini API error: {e}")
-#         return [fallback_shorten(n) for n in narrations], ["No GST"] * len(narrations), ["-"] * len(narrations)
-
-# def extract_transactions(file_bytes, password=""):
-#     pages_text = extract_text_from_pdf(file_bytes, password)
-#     if not pages_text:
-#         return None, "Could not extract text from PDF"
-
-#     if not os.getenv("GEMINI_API_KEY"):
-#         return None, "No GEMINI_API_KEY found in .env"
-
-#     all_raw_transactions = []
-
-#     for page_num, page_text in enumerate(pages_text):
-#         if not page_text.strip():
-#             continue
-#         page_transactions = parse_page_with_gemini(page_text, page_num)
-#         all_raw_transactions.extend(page_transactions)
-#         if len(pages_text) > 5:
-#             time.sleep(0.3)
-
-#     if not all_raw_transactions:
-#         return None, "No transactions found"
-
-#     print(f"Total transactions extracted: {len(all_raw_transactions)}")
-
-#     narrations = [t.get("narration", "") for t in all_raw_transactions]
-#     short_narrations, gst_tags, categories = process_narrations_batch(narrations)
-
-#     final_transactions = []
-#     for i, t in enumerate(all_raw_transactions):
-#         date      = clean(t.get("date", ""))
-#         narration = clean(t.get("narration", ""))
-#         chq       = clean(t.get("chq_ref", "")) or "-"
-#         dr_cr     = clean(t.get("dr_cr", ""))
-#         amount    = clean(t.get("amount", "")) or "-"
-#         short     = short_narrations[i] or "-"
-#         gst       = gst_tags[i] or "-"
-#         category  = categories[i] or "-"
-
-#         if dr_cr.upper() in ["DR", "DEBIT", "D"]:
-#             dr_cr = "Dr"
-#         elif dr_cr.upper() in ["CR", "CREDIT", "C"]:
-#             dr_cr = "Cr"
-#         else:
-#             dr_cr = "-"
-
-#         final_transactions.append([date, narration, short, chq, dr_cr, amount, gst, category])
-
-#     clean_header = ["Date", "Narration", "Narration(Short)", "Chq./Ref.No.", "Dr/Cr", "Amount(₹)", "GST", "Category"]
-#     df = pd.DataFrame(final_transactions, columns=clean_header)
-#     df = df.map(lambda x: re.sub(r'\s+', ' ', str(x)).strip() if x else "")
-#     df = df[df["Date"].apply(is_date)]
-#     df.reset_index(drop=True, inplace=True)
-
-#     if df.empty:
-#         return None, "No valid transactions found after filtering"
-
-#     return df, None
-
-
-# import pdfplumber
-# import pypdf
-# import pandas as pd
-# import re
-# import io
-# import os
-# import json
-# import time
-# import google.generativeai as genai
-# from dotenv import load_dotenv
-
-# load_dotenv()
-
-# genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-# model = genai.GenerativeModel("gemini-2.0-flash")
-
-# # ─────────────────────────────────────────────
-# # HELPERS
-# # ─────────────────────────────────────────────
-
-# def unlock_pdf(file_bytes, password):
-#     reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-#     if reader.is_encrypted:
-#         reader.decrypt(password)
-#     writer = pypdf.PdfWriter()
-#     for page in reader.pages:
-#         writer.add_page(page)
-#     out = io.BytesIO()
-#     writer.write(out)
-#     out.seek(0)
-#     return out
-
-# def clean(val):
-#     return re.sub(r'\s+', ' ', str(val)).strip() if val else ""
-
-# def is_date(text):
-#     return bool(re.match(r'^\d{2}[/\-\.]\d{2}[/\-\.]\d{2,4}$', str(text).strip()))
-
-# def is_amount(text):
-#     return bool(re.match(r'^[\d,]+\.\d{2}$', str(text).strip()))
-
-# def parse_amount(text):
-#     try:
-#         return float(str(text).replace(',', '').strip())
-#     except:
-#         return None
-
-# def fallback_shorten(narration):
-#     if not narration:
-#         return "-"
-#     cleaned = re.sub(r'[0-9@#\.\-\_\/]', ' ', narration.upper())
-#     words = [w for w in cleaned.split() if len(w) > 2][:4]
-#     return " ".join(words).title() if words else narration[:30].title()
-
-# # ─────────────────────────────────────────────
-# # PDF EXTRACTION — pure pdfplumber, no AI
-# # ─────────────────────────────────────────────
-
-# def best_table_rows(page):
-#     strategies = [
-#         {"vertical_strategy": "lines",  "horizontal_strategy": "lines"},
-#         {"vertical_strategy": "lines",  "horizontal_strategy": "text"},
-#         {"vertical_strategy": "text",   "horizontal_strategy": "lines"},
-#         {"vertical_strategy": "text",   "horizontal_strategy": "text"},
-#     ]
-#     best, best_score = [], -1
-#     for s in strategies:
-#         tables = page.extract_tables(s)
-#         if not tables:
-#             continue
-#         rows = [r for t in tables for r in t if t]
-#         score = sum(
-#             1 for r in rows if r and any(
-#                 re.match(r'^\d{2}[/\-\.]\d{2}[/\-\.]\d{2,4}', clean(c))
-#                 for c in r[:3]
-#             )
-#         )
-#         if score > best_score:
-#             best, best_score = rows, score
-#     return best
-
-# def detect_columns(rows):
-#     col_keywords = {
-#         "date":       ["date", "txn date", "tran date", "transaction date", "posting date", "value date"],
-#         "narration":  ["narration", "particulars", "description", "details", "remarks", "transaction details"],
-#         "ref":        ["chq", "ref", "cheque", "reference", "chq./ref", "utr", "transaction id", "txn id"],
-#         "withdrawal": ["withdrawal", "debit", "dr", "debit amount", "withdrawal amt", "paid out", "amount dr"],
-#         "deposit":    ["deposit", "credit", "cr", "credit amount", "deposit amt", "paid in", "amount cr"],
-#         "closing":    ["balance", "closing", "running balance", "closing balance"],
-#     }
-
-#     col_map = {}
-
-#     # Try header row detection first
-#     for row in rows[:8]:
-#         if not row:
-#             continue
-#         cells = [clean(c).lower() for c in row]
-#         if any("date" in c for c in cells) and any(
-#             any(kw in c for kw in ["narration", "particular", "description", "details"])
-#             for c in cells
-#         ):
-#             for col_type, keywords in col_keywords.items():
-#                 for idx, cell in enumerate(cells):
-#                     if any(kw in cell for kw in keywords) and col_type not in col_map:
-#                         col_map[col_type] = idx
-#             break
-
-#     if col_map:
-#         return col_map
-
-#     # Auto-detect from first data row
-#     for row in rows[:5]:
-#         if not row:
-#             continue
-#         cells = [clean(c) for c in row]
-
-#         date_idx = next(
-#             (i for i, c in enumerate(cells[:3])
-#              if re.match(r'^\d{2}[/\-\.]\d{2}[/\-\.]\d{2,4}', c)), None
-#         )
-#         if date_idx is None:
-#             continue
-
-#         amt_indices = [
-#             i for i, c in enumerate(cells)
-#             if is_amount(c.replace('-', '').strip()) and c.strip() not in ('', '-')
-#         ]
-
-#         narr_idx = next(
-#             (i for i in range(date_idx + 1, len(cells))
-#              if cells[i] and cells[i] != '-'
-#              and not re.match(r'^\d{2}[/\-\.]\d{2}[/\-\.]\d{2,4}', cells[i])
-#              and not is_amount(cells[i])
-#              and len(cells[i]) > 5), None
-#         )
-
-#         ref_idx = None
-#         if narr_idx is not None:
-#             ref_idx = next(
-#                 (i for i in range(narr_idx + 1, len(cells))
-#                  if cells[i] and cells[i] != '-' and not is_amount(cells[i])), None
-#             )
-
-#         if len(amt_indices) >= 3:
-#             col_map["withdrawal"] = amt_indices[-3]
-#             col_map["deposit"]    = amt_indices[-2]
-#             col_map["closing"]    = amt_indices[-1]
-#         elif len(amt_indices) == 2:
-#             col_map["deposit"]  = amt_indices[-2]
-#             col_map["closing"]  = amt_indices[-1]
-#         elif len(amt_indices) == 1:
-#             col_map["closing"]  = amt_indices[-1]
-
-#         if date_idx  is not None: col_map["date"]      = date_idx
-#         if narr_idx  is not None: col_map["narration"] = narr_idx
-#         if ref_idx   is not None: col_map["ref"]       = ref_idx
-#         break
-
-#     return col_map
-
-# def parse_rows_to_transactions(rows, col_map):
-#     transactions = []
-
-#     def gcol(cells, key):
-#         idx = col_map.get(key)
-#         if idx is not None and idx < len(cells):
-#             v = clean(cells[idx])
-#             return "" if v in ("-", "None") else v
-#         return ""
-
-#     for row in rows:
-#         if not row:
-#             continue
-#         cells = [clean(c) for c in row]
-
-#         row_text = " ".join(cells).lower()
-#         if any(kw in row_text for kw in ["narration", "particulars", "description"]) and \
-#            any(kw in row_text for kw in ["date", "withdrawal", "deposit", "debit", "credit"]):
-#             continue
-
-#         date_val = gcol(cells, "date")
-#         if not date_val:
-#             for c in cells[:3]:
-#                 if re.match(r'^\d{2}[/\-\.]\d{2}[/\-\.]\d{2,4}', c):
-#                     date_val = c
-#                     break
-#         if not date_val or not is_date(date_val):
-#             continue
-
-#         narr_val = gcol(cells, "narration") or (cells[1] if len(cells) > 1 else "")
-#         narr_val = re.sub(r'\s+', ' ', narr_val).strip()
-#         ref_val  = gcol(cells, "ref")
-#         wd_val   = gcol(cells, "withdrawal")
-#         dep_val  = gcol(cells, "deposit")
-
-#         if not ref_val:
-#             for c in cells:
-#                 if re.match(r'^[A-Z0-9]{10,}$', c):
-#                     ref_val = c
-#                     break
-
-#         wd_num  = parse_amount(wd_val)
-#         dep_num = parse_amount(dep_val)
-
-#         if wd_num and wd_num > 0:
-#             dr_cr  = "Dr"
-#             amount = wd_val
-#         elif dep_num and dep_num > 0:
-#             dr_cr  = "Cr"
-#             amount = dep_val
-#         else:
-#             continue
-
-#         transactions.append({
-#             "date":      date_val,
-#             "narration": narr_val or "-",
-#             "chq_ref":   ref_val  or "-",
-#             "dr_cr":     dr_cr,
-#             "amount":    amount,
-#         })
-
-#     return transactions
-
-# def extract_transactions_from_pdf(file_bytes, password=""):
-#     unlocked = unlock_pdf(file_bytes, password)
-#     all_transactions = []
-
-#     with pdfplumber.open(unlocked) as pdf:
-#         for page in pdf.pages:
-#             rows = best_table_rows(page)
-#             if not rows:
-#                 continue
-#             col_map = detect_columns(rows)
-#             if not col_map:
-#                 continue
-#             txns = parse_rows_to_transactions(rows, col_map)
-#             all_transactions.extend(txns)
-#             print(f"Page extracted: {len(txns)} transactions")
-
-#     return all_transactions
-
-# # ─────────────────────────────────────────────
-# # GEMINI — single call for short, GST, category
-# # ─────────────────────────────────────────────
-
-# def call_gemini(prompt, retries=3):
-#     for attempt in range(retries):
-#         try:
-#             response = model.generate_content(
-#                 prompt,
-#                 generation_config=genai.GenerationConfig(temperature=0)
-#             )
-#             return response.text.strip()
-#         except Exception as e:
-#             err = str(e)
-#             if "429" in err or "quota" in err.lower() or "rate" in err.lower():
-#                 delay_match = re.search(r'retry_delay\s*\{\s*seconds:\s*(\d+)', err)
-#                 wait = int(delay_match.group(1)) + 2 if delay_match else 30
-#                 print(f"Rate limited. Waiting {wait}s... (attempt {attempt+1}/{retries})")
-#                 time.sleep(wait)
-#             else:
-#                 raise e
-#     raise Exception(f"Gemini failed after {retries} retries")
-
-# def enrich_narrations(narrations):
-#     """
-#     Single Gemini call — returns (short_narrations, gst_tags, categories).
-#     Falls back gracefully if Gemini unavailable.
-#     """
-#     if not os.getenv("GEMINI_API_KEY") or not narrations:
-#         return (
-#             [fallback_shorten(n) for n in narrations],
-#             ["No GST"] * len(narrations),
-#             ["-"] * len(narrations)
-#         )
-
-#     narration_list = "\n".join([f"{i+1}. {n}" for i, n in enumerate(narrations)])
-
-#     prompt = f"""You are an expert Indian bank transaction analyst.
-
-# For each transaction narration below, return three things:
-# 1. short: a human-readable label (max 5 words)
-# 2. gst: "GST" or "No GST"
-# 3. category: short business purpose (3-6 words)
-
-# SHORT RULES:
-# - Format: "UPI to [Name]", "NEFT from [Name]", "NEFT to [Name]", "ATM Withdrawal", "Salary Credit", "EMI Payment"
-# - Extract actual person or business name
-# - Remove reference numbers, bank codes, transaction IDs
-
-# GST RULES:
-# - GST if: payment to registered business, online shopping, food delivery, travel, hotels, telecom/internet bills, software/streaming subscriptions, professional services, companies with PVT/LTD/LLP/CORP/ENTERPRISE/INDUSTRIES/TRADERS/SOLUTIONS/SERVICES/TECHNOLOGIES, payment gateways (PAYU/RAZORPAY/BILLDESK/CCAVENUE/EASEBUZZ)
-# - No GST if: transfer to individual person, salary, residential rent, loan EMI, insurance, mutual fund/SIP/stocks, ATM withdrawal, income tax, TDS, government payments
-# - Personal name (first+last) = No GST. If unclear = No GST.
-
-# CATEGORY RULES:
-# - Specific and descriptive (3-6 words)
-# - Do not just repeat the short description
-
-# IMPORTANT: Return exactly {len(narrations)} objects.
-# Respond ONLY with a raw JSON array, no markdown, no explanation.
-# Each object: {{"short": "...", "gst": "GST" or "No GST", "category": "..."}}
-
-# Narrations:
-# {narration_list}"""
-
-#     try:
-#         content = call_gemini(prompt)
-#         content = re.sub(r'^```(?:json)?\s*', '', content)
-#         content = re.sub(r'\s*```$', '', content)
-#         match = re.search(r'\[.*\]', content, re.DOTALL)
-#         if match:
-#             result = json.loads(match.group())
-#             if isinstance(result, list) and len(result) > 0:
-#                 while len(result) < len(narrations):
-#                     result.append({"short": "-", "gst": "No GST", "category": "-"})
-#                 result = result[:len(narrations)]
-#                 shorts     = [str(r.get("short",    "-")).strip() or "-" for r in result]
-#                 gst_tags   = ["GST" if str(r.get("gst", "")).upper() == "GST" else "No GST" for r in result]
-#                 categories = [str(r.get("category", "-")).strip() or "-" for r in result]
-#                 return shorts, gst_tags, categories
-
-#     except Exception as e:
-#         print(f"Gemini error: {e}")
-
-#     return (
-#         [fallback_shorten(n) for n in narrations],
-#         ["No GST"] * len(narrations),
-#         ["-"] * len(narrations)
-#     )
-
-# # ─────────────────────────────────────────────
-# # MAIN ENTRY POINT
-# # ─────────────────────────────────────────────
-
-# def extract_transactions(file_bytes, password=""):
-#     # Step 1: Extract everything with pdfplumber — no AI
-#     transactions = extract_transactions_from_pdf(file_bytes, password)
-
-#     if not transactions:
-#         return None, "No transactions found"
-
-#     print(f"Total transactions extracted: {len(transactions)}")
-
-#     # Step 2: Single Gemini call for short narration + GST + category
-#     narrations = [t["narration"] for t in transactions]
-#     shorts, gst_tags, categories = enrich_narrations(narrations)
-
-#     # Step 3: Build final dataframe
-#     final = []
-#     for i, t in enumerate(transactions):
-#         final.append([
-#             t["date"],
-#             t["narration"],
-#             shorts[i],
-#             t["chq_ref"],
-#             t["dr_cr"],
-#             t["amount"],
-#             gst_tags[i],
-#             categories[i],
-#         ])
-
-#     columns = ["Date", "Narration", "Narration(Short)", "Chq./Ref.No.", "Dr/Cr", "Amount(₹)", "GST", "Category"]
-#     df = pd.DataFrame(final, columns=columns)
-#     df = df.map(lambda x: re.sub(r'\s+', ' ', str(x)).strip() if x else "")
-#     df = df[df["Date"].apply(is_date)]
-#     df.reset_index(drop=True, inplace=True)
-
-#     if df.empty:
-#         return None, "No valid transactions found after filtering"
-
-#     return df, None
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import pdfplumber
 import pypdf
 import pandas as pd
@@ -1527,6 +5,7 @@ import re
 import io
 import os
 import json
+from difflib import SequenceMatcher
 from groq import Groq
 from dotenv import load_dotenv
 
@@ -1576,6 +55,137 @@ def fallback_shorten(narration):
     cleaned = re.sub(r'[0-9@#\.\-\_\/]', ' ', narration.upper())
     words = [w for w in cleaned.split() if len(w) > 2][:4]
     return " ".join(words).title() if words else narration[:30].title()
+
+def detect_transfer_type(narration):
+    text = re.sub(r'\s*\[(Dr|Cr)\]\s*$', '', str(narration or ""), flags=re.IGNORECASE).upper().strip()
+    if re.search(r'\bNEFT\b', text):
+        return "NEFT"
+    if re.search(r'\bUPI\b', text):
+        return "UPI"
+    if re.search(r'\bIMPS\b', text):
+        return "IMPS"
+    if re.search(r'\bRTGS\b', text):
+        return "RTGS"
+    if re.search(r'\bACH\b|\bNACH\b', text):
+        return "ACH"
+    return ""
+
+def merge_short_with_transfer(short_name, narration):
+    short_name = str(short_name or "").strip()
+    if not short_name:
+        return smart_shorten(narration)
+    if re.search(r'\([^)]*\)\s*$', short_name):
+        return short_name
+
+    transfer_type = detect_transfer_type(narration)
+    if not transfer_type:
+        return short_name
+
+    if short_name.upper() in {"ATM WITHDRAWAL", "BANK CHARGES"}:
+        return short_name
+
+    return f"{short_name} ({transfer_type})"
+
+def smart_shorten(narration):
+    """
+    Extract a clean human-readable party name from a raw bank narration.
+    Strategy: skip leading noise/bank-code tokens, then STOP collecting at the
+    first noise/city/ref token after the name begins.
+    This way 'NEFTDR INDB UTKARSH KUMAR MUM LEWJUJ' → 'Utkarsh Kumar (NEFT)'
+    because MUM (city code) terminates collection immediately.
+    """
+    if not narration:
+        return "-"
+
+    # Strip [Dr] / [Cr] suffix that Groq pipeline appends
+    text = re.sub(r'\s*\[(Dr|Cr)\]\s*$', '', narration, flags=re.IGNORECASE).upper().strip()
+
+    # ATM / cash withdrawal detection first
+    if re.search(r'\bATM\b', text) or re.search(r'\bCASH WD\b|\bCASH WITHDRAWAL\b', text):
+        return "ATM Withdrawal"
+
+    # Detect transfer type from full string before we mangle it
+    transfer_type = detect_transfer_type(text)
+
+    # Complete stop-word set: ANYTHING that is not a person/company name fragment.
+    # City codes are critical — they mark the END of the name in NEFT narrations.
+    _STOP = {
+        # Transfer type + direction combos
+        "NEFTDR", "NEFTCR", "IMPSDR", "IMPSCR", "RTGSDR", "RTGSCR", "UPIDR", "UPICR",
+        "ACHDR", "ACHCR", "NACHDR", "NACHCR",
+        # Transfer types standalone
+        "NEFT", "UPI", "IMPS", "RTGS", "ACH", "NACH", "ECS", "CHQ", "CHEQUE",
+        # Direction
+        "DR", "CR", "DB",
+        # Known bank IFSC prefixes / abbreviations
+        "INDB", "HDFC", "HDFCH", "SBIN", "ICIC", "ICICI", "AXIS", "UTIB",
+        "KOTAK", "KKBK", "YESB", "YESBNK", "IDBI", "PNB", "PUNB", "BOI",
+        "BOB", "BARB", "CANARA", "CNRB", "UNION", "UBIN", "UCO", "UCOB",
+        "FEDERAL", "FDRL", "SCB", "SCBL", "CITI", "CITN", "HSBC", "HSBCH",
+        "DBS", "DBSS", "RBL", "RATN", "INDUS", "INDU", "IDFCF", "IDFC",
+        "AUSFB", "AUSF", "UJJIV", "UJJI", "FINO", "ESAF", "JAKA",
+        # Channel / medium keywords
+        "NETBAN", "NETBANK", "NETBANKING", "INB", "MB", "MOB", "MOBILE",
+        "INTERNET", "BANKING", "ONLINE", "ATM",
+        # City / location codes (VERY important — mark end-of-name in NEFT strings)
+        "MUM", "MUMBAI", "BOM",
+        "DEL", "DELHI", "NEWDELHI",
+        "BLR", "BANG", "BANGALORE", "BENGALURU",
+        "CHN", "MAD", "CHENNAI", "MADRAS",
+        "HYD", "HYDERABAD",
+        "PUN", "PUNE",
+        "AHM", "AHMD", "AHMEDABAD",
+        "KOL", "KOLKATA", "CALCUTTA",
+        "GOA", "NCR", "NAVI",
+        # Reference / transaction ID fragments
+        "REF", "REFNO", "TXN", "TXNID", "UTR", "UTRNO", "TRAN", "TRANS",
+        "PD", "TO", "BY", "FROM", "IN", "OUT",
+        # Generic descriptor words
+        "TRANSFER", "CREDIT", "DEBIT", "PAYMENT", "RECEIVED", "RECEIPT",
+        "SALARY", "SAL", "ADVANCE", "FUND", "FUNDS",
+    }
+
+    def _is_stop(tok):
+        """True if this token is noise/infrastructure, not a name fragment."""
+        if tok in _STOP:
+            return True
+        if len(tok) <= 2:
+            return True
+        # Starts with NB → netbanking reference code (NBMUTD, NBZHZIU, NBEFIJIT…)
+        if tok.startswith("NB") and len(tok) >= 4:
+            return True
+        # Zero vowels → pure bank/IFSC abbreviation
+        vowels = sum(1 for c in tok if c in "AEIOU")
+        if vowels == 0:
+            return True
+        # Has any digit → reference/account number fragment
+        if any(c.isdigit() for c in tok):
+            return True
+        return False
+
+    # Normalise to alpha only, then split
+    alpha_text = re.sub(r'[^A-Z\s]', ' ', text)
+    tokens = [t for t in alpha_text.split() if t]
+
+    # Phase 1: skip all leading stop tokens (prefix noise)
+    start = 0
+    while start < len(tokens) and _is_stop(tokens[start]):
+        start += 1
+
+    # Phase 2: collect name tokens and STOP at the first stop token we hit
+    name_tokens = []
+    for tok in tokens[start:]:
+        if _is_stop(tok):
+            break          # city / channel / bank code marks the end of the name
+        name_tokens.append(tok)
+
+    if not name_tokens:
+        # Last resort: pick longest non-tiny tokens from full set
+        candidates = [t for t in tokens if len(t) >= 4 and not _is_stop(t)][:3]
+        name_tokens = candidates if candidates else tokens[:3]
+
+    name = " ".join(name_tokens[:5]).title()
+    return f"{name} ({transfer_type})" if transfer_type else name
 
 # ─────────────────────────────────────────────
 # COLUMN DETECTION
@@ -1891,7 +501,7 @@ def enrich_narrations(narrations_with_drcr):
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key or not narrations_with_drcr:
         n = len(narrations_with_drcr)
-        return ([fallback_shorten(x) for x in narrations_with_drcr],
+        return ([smart_shorten(x) for x in narrations_with_drcr],
                 [""] * n, ["-"] * n, [""] * n, [False] * n)
 
     client   = Groq(api_key=api_key)
@@ -1915,18 +525,15 @@ FIELDS:
   * For bank charges: "Bank Charges"
 
 - gst: ITC eligibility — choose ONE of:
-  * "ITC Eligible" — payment to GST-registered business, claimable input credit
-  * "Zero Rated"   — export of services/goods, foreign payment (SWIFT/USD/AED/GBP)
-  * "No GST"       — salary to individual, ATM, personal transfer, insurance, loan EMI, mutual fund
-  * ""             — cannot determine from narration alone
+    * "No GST"       — ONLY for clear salary-to-individual payments
+    * "Zero Rated"   — ONLY for very clear export / foreign receipt cases
+    * "ITC Eligible" — use ONLY if the narration itself makes business GST eligibility obvious beyond doubt
+    * ""             — default for insurance, business payments, subscriptions, vendors, loan EMI, mutual fund, personal transfers, and all uncertain cases
+    * Be conservative: if there is any doubt, leave gst as ""
 
 - gst_notes: one short sentence explaining gst decision
   * Salary: "Salary Payment (Outside GST Scope)"
-  * ATM: "Outside GST Scope"
-  * Insurance: "ITC Blocked u/s 17(5) - No Claim"
-  * Business: "GST Applicable - ITC Claimable"
-  * Bank fee: "GST Applicable - Bank Fee"
-  * Export: "Export of Service - Zero Rated"
+    * Export: "Export of Service - Zero Rated"
   * Blank if gst is ""
 
 - category: specific real-world purpose, max 8 words
@@ -1935,6 +542,11 @@ FIELDS:
   * [Cr] from individual → "Payment Received from Individual"
   * [Cr] from business → "Business Receipt" or specific purpose
   * Never use "Personal Transfer" — always infer the real purpose
+
+IMPORTANT GST RULE:
+- If is_salary is true, gst should usually be "No GST"
+- If is_salary is false, prefer gst="" and gst_notes="" unless export/foreign receipt is extremely clear
+- For insurance, vendors, business expenses, software tools, subscriptions, bank charges, loan EMI, investments, and ambiguous business receipts: keep gst blank
 
 - is_salary: boolean
   * true ONLY if: transaction is [Dr] AND recipient is a real human name (2-3 words, no company suffix)
@@ -1984,7 +596,7 @@ Narrations:
         except Exception as e:
             print(f"Groq error on chunk {start}: {e}")
             n = len(chunk)
-            all_shorts.extend([fallback_shorten(x) for x in chunk])
+            all_shorts.extend([smart_shorten(x) for x in chunk])
             all_gst   .extend([""] * n)
             all_cats  .extend(["-"] * n)
             all_notes .extend([""] * n)
@@ -2031,8 +643,7 @@ def extract_transactions(file_bytes, password=""):
         else:
             # Don't wipe Groq's decision — only clear if Groq returned something wrong
             # Leave gst_tags[i] and gst_notes[i] as Groq returned them
-            gst_tags[i]  = ""
-            gst_notes[i] = ""
+            pass
 
     # ── Build final dataframe ────────────────────────────────────
     final = []
@@ -2047,6 +658,355 @@ def extract_transactions(file_bytes, password=""):
             categories[i],
             gst_tags[i],
             gst_notes[i],
+        ])
+
+    columns = ["Date", "Narration", "Narration(Short)", "Chq./Ref.No.",
+               "Dr/Cr", "Amount(₹)", "Category", "GST", "GST Notes"]
+    df = pd.DataFrame(final, columns=columns)
+    df = df.map(lambda x: re.sub(r'\s+', ' ', str(x)).strip() if x else "")
+    df = df[df["Date"].apply(is_date)]
+    df.reset_index(drop=True, inplace=True)
+
+    if df.empty:
+        return None, "No valid transactions found after filtering"
+
+    return df, None
+
+# ─────────────────────────────────────────────
+# EXCEL MEMORY — PARTY RULES
+# ─────────────────────────────────────────────
+
+def clean_party_name(name):
+    """Normalize narration/party text into a stable identity for matching."""
+    if not name:
+        return ""
+    result = str(name).upper()
+
+    # Drop IDs, punctuation-heavy fragments and bracketed transfer info.
+    result = re.sub(r'\([^)]*\)', ' ', result)
+    result = re.sub(r'[^A-Z\s]', ' ', result)
+    result = re.sub(r'\s+', ' ', result).strip()
+
+    stop_words = {
+        "UPI", "NEFT", "IMPS", "RTGS", "ACH", "CHQ", "CHEQUE", "REF", "REFNO",
+        "TRANSFER", "PAYMENT", "RECEIVED", "RECEIPT", "CREDIT", "DEBIT",
+        "NETBANK", "NETBANKING", "INB", "MB", "MOB", "INSTA", "BY", "TO", "FROM",
+        "THE", "AND", "BANK", "PVT", "LTD", "LIMITED", "PRIVATE", "INDIA", "MUM", "DELHI",
+    }
+
+    tokens = [t for t in result.split() if len(t) > 1 and t not in stop_words]
+    return " ".join(tokens[:8]).strip()
+
+
+def fuzzy_score(a, b):
+    """Hybrid similarity score using sequence ratio + token overlap."""
+    a, b = a.lower().strip(), b.lower().strip()
+    if not a or not b:
+        return 0
+
+    if a in b or b in a:
+        return 96
+
+    seq_score = int(SequenceMatcher(None, a, b).ratio() * 100)
+
+    ta = set(a.split())
+    tb = set(b.split())
+    token_score = 0
+    if ta and tb:
+        token_score = int((len(ta & tb) / max(1, min(len(ta), len(tb)))) * 100)
+
+    return max(seq_score, token_score)
+
+
+def normalize_date_key(text):
+    s = str(text or "").strip()
+    if not s:
+        return ""
+    m = re.match(r'^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})$', s)
+    if not m:
+        return s
+    d, mo, y = m.groups()
+    if len(y) == 2:
+        y = "20" + y
+    return f"{int(d):02d}/{int(mo):02d}/{y}"
+
+
+def normalize_amount_key(text):
+    v = parse_amount(text)
+    if v is None:
+        return ""
+    return f"{v:.2f}"
+
+
+def normalize_drcr_key(text):
+    s = str(text or "").strip().upper()
+    if s.startswith("D"):
+        return "DR"
+    if s.startswith("C"):
+        return "CR"
+    return s
+
+
+def load_party_rules(excel_bytes):
+    """
+    Read a previously tagged Excel file and build a party → tags lookup.
+    Returns dict: { cleaned_party_name: {Category, GST, GST Notes} }
+    """
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(excel_bytes), data_only=True)
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return {}
+
+        # Find header row
+        header = None
+        header_idx = 0
+        for i, row in enumerate(rows[:5]):
+            row_lower = [str(c or "").lower() for c in row]
+            if any("narration" in c or "party" in c for c in row_lower):
+                header = row_lower
+                header_idx = i
+                break
+
+        if not header:
+            return {}
+
+        # Find column indexes
+        def find_col(keywords):
+            for j, h in enumerate(header):
+                if any(kw in h for kw in keywords):
+                    return j
+            return None
+
+        short_col = find_col(["short", "party"])
+        cat_col   = find_col(["category"])
+        gst_col   = find_col(["gst mark", "gst"])
+        note_col  = find_col(["gst note", "notes"])
+
+        if short_col is None or cat_col is None:
+            return {}
+
+        rules = {}
+        txn_rules = {}
+        amt_dr_candidates = {}
+
+        date_col = find_col(["date", "txn date", "value date"]) 
+        drcr_col = find_col(["dr/cr", "dr cr", "debit/credit", "debit credit"]) 
+        amt_col = find_col(["amount", "amount(₹)", "amount rs", "amount inr"]) 
+
+        for row in rows[header_idx + 1:]:
+            party = str(row[short_col] or "").strip()
+            cat   = str(row[cat_col]   or "").strip() if cat_col is not None else ""
+            gst   = str(row[gst_col]   or "").strip() if gst_col is not None else ""
+            note  = str(row[note_col]  or "").strip() if note_col is not None else ""
+
+            if not party or not cat or cat in ("-", "None"):
+                continue
+
+            key = clean_party_name(party)
+            if key:
+                rules[key] = {"Category": cat, "GST": gst, "GST Notes": note}
+
+            # Transaction signature memory: (Date, Dr/Cr, Amount) -> tags
+            if date_col is not None and drcr_col is not None and amt_col is not None:
+                date_key = normalize_date_key(row[date_col] if date_col < len(row) else "")
+                drcr_key = normalize_drcr_key(row[drcr_col] if drcr_col < len(row) else "")
+                amt_key = normalize_amount_key(row[amt_col] if amt_col < len(row) else "")
+                if date_key and drcr_key and amt_key:
+                    tags_obj = {
+                        "Category": cat,
+                        "GST": gst,
+                        "GST Notes": note,
+                        "Narration(Short)": party,
+                    }
+                    txn_rules[(date_key, drcr_key, amt_key)] = tags_obj
+
+                    # Date-agnostic fallback key for next months.
+                    amt_dr_key = (drcr_key, amt_key)
+                    amt_dr_candidates.setdefault(amt_dr_key, []).append(tags_obj)
+
+        # Keep only unambiguous (Dr/Cr, Amount) mappings.
+        amt_dr_rules = {}
+        for key, arr in amt_dr_candidates.items():
+            uniq = {
+                (
+                    str(x.get("Category", "")).strip(),
+                    str(x.get("GST", "")).strip(),
+                    str(x.get("GST Notes", "")).strip(),
+                    str(x.get("Narration(Short)", "")).strip(),
+                )
+                for x in arr
+            }
+            if len(uniq) == 1:
+                c, g, n, s = next(iter(uniq))
+                amt_dr_rules[key] = {
+                    "Category": c,
+                    "GST": g,
+                    "GST Notes": n,
+                    "Narration(Short)": s,
+                }
+
+        print(
+            f"Loaded {len(rules)} party rules, {len(txn_rules)} txn rules, "
+            f"{len(amt_dr_rules)} amt-dr rules from Excel"
+        )
+        return {"party_rules": rules, "txn_rules": txn_rules, "amt_dr_rules": amt_dr_rules}
+
+    except Exception as e:
+        print(f"load_party_rules error: {e}")
+        return {"party_rules": {}, "txn_rules": {}, "amt_dr_rules": {}}
+
+
+def match_party(party_name, party_rules, threshold=68):
+    """
+    Find best matching party from rules.
+    Returns tags dict if match found above threshold, else None.
+    Priority:
+      1. Exact match on cleaned name
+      2. One contains the other
+      3. Fuzzy score above threshold
+    """
+    if not party_name or not party_rules:
+        return None
+
+    cleaned = clean_party_name(party_name)
+    if not cleaned:
+        return None
+
+    best_score = 0
+    best_match = None
+
+    for known_party, tags in party_rules.items():
+        # Exact match
+        if cleaned == known_party:
+            return tags
+
+        # Substring match
+        if cleaned in known_party or known_party in cleaned:
+            score = 92
+        else:
+            score = fuzzy_score(cleaned, known_party)
+
+        if score > best_score:
+            best_score = score
+            best_match = known_party
+
+    if best_score >= threshold and best_match:
+        print(f"  Matched '{party_name}' → '{best_match}' (score={best_score})")
+        return party_rules[best_match]
+
+    return None
+
+
+def extract_transactions_with_memory(file_bytes, password="", excel_bytes=None):
+    """
+    Enhanced extraction that uses previous Excel to pre-fill known parties.
+    Falls back to Groq only for unrecognised transactions.
+    """
+    transactions = extract_transactions_from_pdf(file_bytes, password)
+
+    if not transactions:
+        return None, "No transactions found"
+
+    print(f"Total transactions extracted: {len(transactions)}")
+
+    # Load party rules from previous Excel (if provided)
+    memory_rules = load_party_rules(excel_bytes) if excel_bytes else {"party_rules": {}, "txn_rules": {}, "amt_dr_rules": {}}
+    party_rules = memory_rules.get("party_rules", {})
+    txn_rules = memory_rules.get("txn_rules", {})
+    amt_dr_rules = memory_rules.get("amt_dr_rules", {})
+
+    # Separate matched vs unmatched
+    matched_indices = {}   # index → tags from Excel
+    groq_indices    = []   # indices that need Groq
+
+    for i, t in enumerate(transactions):
+        # 1) Month-independent party match first.
+        party = t.get("narration_short") or t["narration"]
+        tags = match_party(party, party_rules)
+        if tags and tags.get("Category") and tags["Category"] not in ("-", ""):
+            matched_indices[i] = tags
+            continue
+
+        # 2) Exact same-transaction match when date also aligns.
+        sig = (
+            normalize_date_key(t.get("date")),
+            normalize_drcr_key(t.get("dr_cr")),
+            normalize_amount_key(t.get("amount")),
+        )
+
+        sig_tags = txn_rules.get(sig)
+        if sig_tags and sig_tags.get("Category") and sig_tags["Category"] not in ("-", ""):
+            matched_indices[i] = sig_tags
+            continue
+
+        # 3) Date-agnostic fallback: (Dr/Cr, Amount) only if mapping is unique.
+        amt_dr_key = (sig[1], sig[2])
+        amt_dr_tags = amt_dr_rules.get(amt_dr_key)
+        if amt_dr_tags and amt_dr_tags.get("Category") and amt_dr_tags["Category"] not in ("-", ""):
+            matched_indices[i] = amt_dr_tags
+            continue
+
+        groq_indices.append(i)
+
+    print(f"  Excel matched: {len(matched_indices)} | Groq needed: {len(groq_indices)}")
+
+    # Run Groq only on unmatched
+    groq_narrations = [
+        f"{transactions[i]['narration']} [{transactions[i].get('dr_cr', '?')}]"
+        for i in groq_indices
+    ]
+
+    shorts_all    = [""] * len(transactions)
+    gst_all       = [""] * len(transactions)
+    cats_all      = [""] * len(transactions)
+    notes_all     = [""] * len(transactions)
+    salary_all    = [False] * len(transactions)
+
+    # Fill matched from Excel
+    for i, tags in matched_indices.items():
+        if tags.get("Narration(Short)"):
+            shorts_all[i] = merge_short_with_transfer(tags.get("Narration(Short)"), transactions[i]["narration"])
+        else:
+            shorts_all[i] = smart_shorten(transactions[i]["narration"])
+        cats_all[i]   = tags.get("Category", "")
+        gst_all[i]    = tags.get("GST", "")
+        notes_all[i]  = tags.get("GST Notes", "")
+        salary_all[i] = "salary" in tags.get("Category", "").lower()
+
+    # Fill Groq results
+    if groq_narrations:
+        g_shorts, g_gst, g_cats, g_notes, g_sal = enrich_narrations(groq_narrations)
+        for pos, i in enumerate(groq_indices):
+            shorts_all[i]  = g_shorts[pos]
+            gst_all[i]     = g_gst[pos]
+            cats_all[i]    = g_cats[pos]
+            notes_all[i]   = g_notes[pos]
+            salary_all[i]  = g_sal[pos]
+
+    # Hardcoded overrides
+    export_contractors = ["bilalmajbour", "bilal majbour", "bilal majbur"]
+
+    for i, t in enumerate(transactions):
+        narr_lower = t["narration"].lower()
+        if any(name in narr_lower for name in export_contractors):
+            gst_all[i]  = "Zero Rated"
+            notes_all[i] = "Export of Service - UAE"
+            cats_all[i]  = "Export Software Contract (UAE, USD)"
+        elif salary_all[i] and t.get("dr_cr") == "Dr":
+            gst_all[i]  = "No GST"
+            notes_all[i] = "Salary Payment (Outside GST Scope)"
+            cats_all[i]  = "Salary Payment"
+
+    # Build final dataframe
+    final = []
+    for i, t in enumerate(transactions):
+        final.append([
+            t["date"], t["narration"], shorts_all[i],
+            t["chq_ref"], t["dr_cr"], t["amount"],
+            cats_all[i], gst_all[i], notes_all[i],
         ])
 
     columns = ["Date", "Narration", "Narration(Short)", "Chq./Ref.No.",
