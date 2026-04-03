@@ -918,6 +918,15 @@
             <input type="file" id="prevExcelInput" accept=".xlsx,.xls" style="display:none;"
               onchange="onExcelAdded(this)" />
           </label>
+          <div id="llmDropdownContainer" style="position: relative;">
+            <button onclick="toggleLocalLLMDropdown()"
+              style="height:32px; padding:0 14px; background:var(--ink); color:#fff; border-radius:7px; font-size:12px; font-weight:600; cursor:pointer; display:flex; align-items:center; gap:5px; white-space:nowrap; border:none; outline:none;">
+              Local LLM <span style="font-size: 10px; margin-left: 2px;">▼</span>
+            </button>
+            <div id="llmDropdown" style="display: none; position: absolute; top: calc(100% + 6px); left: 0; background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow-lg); border-radius: 8px; padding: 12px; z-index: 1000; min-width: 170px; font-size: 13px; color: var(--ink);">
+              <div id="llmScanResult">No scan yet</div>
+            </div>
+          </div>
           <span id="excelFileName" style="font-size:12px; color:var(--green); font-weight:500;"></span>
           <button id="excelClearBtn" onclick="clearExcel()"
             style="display:none; background:none; border:none; color:var(--muted-2); cursor:pointer; font-size:14px; padding:0;">✕</button>
@@ -1344,6 +1353,56 @@
       const res = await fetch("/download_excel_multi", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
       if (res.ok) { const blob = await res.blob(); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "transactions.xlsx"; a.click(); URL.revokeObjectURL(a.href); }
       else alert("Download failed!");
+    }
+
+    async function toggleLocalLLMDropdown() {
+      const dropdown = document.getElementById("llmDropdown");
+      if (dropdown.style.display === "none") {
+        dropdown.style.display = "block";
+        await scanLocalLLM();
+      } else {
+        dropdown.style.display = "none";
+      }
+    }
+
+    document.addEventListener("click", e => {
+      const dropdown = document.getElementById("llmDropdown");
+      const container = document.getElementById("llmDropdownContainer");
+      if (dropdown && dropdown.style.display === "block") {
+        if (container && !container.contains(e.target)) {
+          dropdown.style.display = "none";
+        }
+      }
+    });
+
+    async function scanLocalLLM() {
+      const resultEl = document.getElementById("llmScanResult");
+      resultEl.innerHTML = "Scanning...";
+
+      const endpoints = [
+        { name: "Ollama", url: "http://localhost:11434/api/tags" },
+        { name: "LM Studio", url: "http://localhost:1234/v1/models" },
+        { name: "Text Generation WebUI", url: "http://localhost:5000" }
+      ];
+
+      const scanPromises = endpoints.map(async (ep) => {
+        try {
+          const res = await fetch(ep.url);
+          if (res.status === 200) return ep.name;
+        } catch (err) {
+          // ignore error
+        }
+        return null;
+      });
+
+      const results = await Promise.all(scanPromises);
+      const detected = results.filter(name => name !== null);
+
+      if (detected.length > 0) {
+        resultEl.innerHTML = "<strong>Detected:</strong><br>- " + detected.join("<br>- ");
+      } else {
+        resultEl.innerHTML = "No Local LLM found";
+      }
     }
   </script>
 </body>
