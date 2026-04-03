@@ -1327,7 +1327,15 @@
       const labelToKey = Object.fromEntries(COLS.map(c => [c.label.toUpperCase(), c.key]));
       function readTable(tableEl) {
         const headers = [...tableEl.querySelectorAll("thead th")].map(th => labelToKey[th.innerText.trim().toUpperCase()] || th.innerText.trim());
-        const rows = [...tableEl.querySelectorAll("tbody tr")].map(tr => [...tr.querySelectorAll("td")].map(td => { const ct = td.querySelector(".cat-text"); if (ct) return ct.innerText.trim(); return td.innerText.trim(); }));
+        const rows = [...tableEl.querySelectorAll("tbody tr")].map(tr => [...tr.querySelectorAll("td")].map((td, i) => { 
+          if (headers[i] === "Bank") {
+            const child = td.firstElementChild;
+            if (child && child.hasAttribute("title")) return child.getAttribute("title");
+          }
+          const ct = td.querySelector(".cat-text"); 
+          if (ct) return ct.innerText.trim(); 
+          return td.innerText.trim(); 
+        }));
         return { headers, rows };
       }
       let payload;
