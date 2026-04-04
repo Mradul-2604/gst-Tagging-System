@@ -1375,23 +1375,38 @@
       }
     });
 
-    async function detectLocalLLM() {
-      try {
-        await fetch("http://localhost:11434", { mode: "no-cors" });
-        return true;
-      } catch (error) {
-        return false;
-      }
-    }
-
     async function scanLocalLLM() {
       const resultEl = document.getElementById("llmScanResult");
       resultEl.innerHTML = "Scanning...";
 
-      const isDetected = await detectLocalLLM();
+      const endpoints = [
+        { name: "Ollama", url: "http://localhost:11434" },
+        { name: "LM Studio", url: "http://localhost:1234" },
+        { name: "Text Generation WebUI", url: "http://localhost:5000" },
+        { name: "Jan", url: "http://localhost:1337" },
+        { name: "LocalAI", url: "http://localhost:8080" }
+      ];
 
-      if (isDetected) {
-        resultEl.innerHTML = "Local LLM detected (Ollama)";
+      const detected = [];
+
+      // Run scans in parallel for speed
+      const scanPromises = endpoints.map(async (ep) => {
+        try {
+          await fetch(ep.url, { mode: "no-cors" });
+          return ep.name;
+        } catch (error) {
+          // fetch throws error if port is closed/refused
+          return null;
+        }
+      });
+
+      const results = await Promise.all(scanPromises);
+      results.forEach(name => {
+        if (name) detected.push(name);
+      });
+
+      if (detected.length > 0) {
+        resultEl.innerHTML = "<strong>Local LLM detected:</strong><br>- " + detected.join("<br>- ");
       } else {
         resultEl.innerHTML = "No Local LLM detected";
       }
