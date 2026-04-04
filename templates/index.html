@@ -1375,33 +1375,25 @@
       }
     });
 
+    async function detectLocalLLM() {
+      try {
+        await fetch("http://localhost:11434", { mode: "no-cors" });
+        return true;
+      } catch (error) {
+        return false;
+      }
+    }
+
     async function scanLocalLLM() {
       const resultEl = document.getElementById("llmScanResult");
       resultEl.innerHTML = "Scanning...";
 
-      const endpoints = [
-        { name: "Ollama", url: "http://localhost:11434/api/tags" },
-        { name: "LM Studio", url: "http://localhost:1234/v1/models" },
-        { name: "Text Generation WebUI", url: "http://localhost:5000" }
-      ];
+      const isDetected = await detectLocalLLM();
 
-      const scanPromises = endpoints.map(async (ep) => {
-        try {
-          const res = await fetch(ep.url);
-          if (res.status === 200) return ep.name;
-        } catch (err) {
-          // ignore error
-        }
-        return null;
-      });
-
-      const results = await Promise.all(scanPromises);
-      const detected = results.filter(name => name !== null);
-
-      if (detected.length > 0) {
-        resultEl.innerHTML = "<strong>Detected:</strong><br>- " + detected.join("<br>- ");
+      if (isDetected) {
+        resultEl.innerHTML = "Local LLM detected (Ollama)";
       } else {
-        resultEl.innerHTML = "No Local LLM found";
+        resultEl.innerHTML = "No Local LLM detected";
       }
     }
   </script>
